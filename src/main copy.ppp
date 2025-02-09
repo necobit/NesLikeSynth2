@@ -1,0 +1,473 @@
+#include <M5Unified.h>
+#include <M5Cardputer.h>
+#include <MIDI.h>
+#include <math.h>
+
+// MIDIインターフェースの設定
+MIDI_CREATE_INSTANCE(HardwareSerial, Serial2, MIDI);
+
+// 定数定義
+const int MAX_VOICES = 16;           // 最大和音数
+const int MAX_CHANNELS = 16;         // MIDIチャンネル数
+const uint32_t SAMPLE_RATE = 44100U; // サンプリングレート
+const int WAVE_TABLE_SIZE = 256;     // 波形テーブルサイズ
+
+// エンベロープクラス
+class Envelope
+{
+private:
+    float attackTime = 0.01f;  // アタックタイム(秒)
+    float decayTime = 0.1f;    // ディケイタイム(秒)
+    float releaseTime = 0.01f; // リリースタイム(秒)
+    float sustainLevel = 1.0f; // サステインレベル
+
+    float currentLevel = 0.0f;   // 現在のレベル
+    int state = 0;               // 0: IDLE, 1: ATTACK, 2: DECAY, 3: SUSTAIN, 4: RELEASE
+    unsigned long startTime = 0; // 状態開始時間
+
+public:
+    void setAttackTime(float time) { attackTime = time; }
+    void setDecayTime(float time) { decayTime = time; }
+    void setReleaseTime(float time) { releaseTime = time; }
+
+    void noteOn()
+    {
+        Serial.println("noteOn");
+        state = 1; // ATTACK
+        startTime = millis();
+    }
+
+    void noteOff()
+    {
+        state = 4; // RELEASE
+        startTime = millis();
+    }
+
+    float process()
+    {
+        float elapsed = (millis() - startTime) / 1000.0f;
+
+        switch (state)
+        {
+        case 1: // ATTACK
+            if (attackTime <= 0)
+            {
+                currentLevel = 1.0f;
+                state = 2; // DECAY
+                startTime = millis();
+            }
+            else
+            {
+                currentLevel = elapsed / attackTime;
+                if (currentLevel >= 1.0f)
+                {
+                    currentLevel = 1.0f;
+                    state = 2; // DECAY
+                    startTime = millis();
+                }
+            }
+            break;
+
+        case 2: // DECAY
+            if (decayTime <= 0)
+            {
+                currentLevel = sustainLevel;
+                state = 3; // SUSTAIN
+            }
+            else
+            {
+                currentLevel = 1.0f - ((1.0f - sustainLevel) * (elapsed / decayTime));
+                if (currentLevel <= sustainLevel)
+                {
+                    currentLevel = sustainLevel;
+                    state = 3; // SUSTAIN
+                }
+            }
+            break;
+
+        case 3: // SUSTAIN
+            currentLevel = sustainLevel;
+            break;
+
+        case 4: // RELEASE
+            if (releaseTime <= 0)
+            {
+                currentLevel = 0.0f;
+                state = 0; // IDLE
+            }
+            else
+            {
+                currentLevel = sustainLevel * (1.0f - (elapsed / releaseTime));
+                if (currentLevel <= 0.0f)
+                {
+                    currentLevel = 0.0f;
+                    state = 0; // IDLE
+                }
+            }
+            break;
+
+        case 0: // IDLE
+        default:
+            currentLevel = 0.0f;
+            break;
+        }
+
+        return currentLevel;
+    }
+};
+
+// ボイスクラス
+class Voice
+{
+private:
+    bool active = false;
+    uint8_t note = 0;
+    uint8_t velocity = 0;
+    uint8_t channel = 0;
+    int waveType = 0; // 0: SQUARE, 1: PULSE_25, 2: PULSE_12_5, 3: PSEUDO_TRI, 4: NOISE_LONG, 5: NOISE_SHORT
+    float phase = 0.0f;
+    float frequency = 440.0f;
+    Envelope env;
+    float volume = 1.0f;
+    float expression = 1.0f;
+    int16_t noiseRegister = 1;
+
+public:
+    void noteOn(uint8_t ch, uint8_t n, uint8_t vel)
+    {
+        channel = ch;
+        note = n;
+        velocity = vel;
+        frequency = 440.0f * pow(2.0f, (note - 69) / 12.0f);
+        active = true;
+        phase = 0.0f;
+        env.noteOn();
+    }
+
+    void noteOff()
+    {
+        env.noteOff();
+    }
+
+    void setWaveType(int type)
+    {
+        waveType = type;
+    }
+
+    void setVolume(float vol)
+    {
+        volume = vol;
+    }
+
+    void setExpression(float exp)
+    {
+        expression = exp;
+    }
+
+    void setAttackTime(float time) { env.setAttackTime(time); }
+    void setDecayTime(float time) { env.setDecayTime(time); }
+    void setReleaseTime(float time) { env.setReleaseTime(time); }
+
+    bool isActive() const { return active; }
+    uint8_t getNote() const { return note; }
+    uint8_t getChannel() const { return channel; }
+
+    float process()
+    {
+        if (!active)
+            return 0.0f;
+
+        float envLevel = env.process();
+        if (envLevel <= 0.0f)
+        {
+            active = false;
+            return 0.0f;
+        }
+
+        float sample = 0.0f;
+
+        switch (waveType)
+        {
+        case 0: // SQUARE
+            sample = phase < 0.5f ? 1.0f : -1.0f;
+            break;
+
+        case 1: // PULSE_25
+            sample = phase < 0.25f ? 1.0f : -1.0f;
+            break;
+
+        case 2: // PULSE_12_5
+            sample = phase < 0.125f ? 1.0f : -1.0f;
+            break;
+
+        case 3: // PSEUDO_TRI
+            if (phase < 0.25f)
+                sample = phase * 4.0f;
+            else if (phase < 0.75f)
+                sample = 2.0f - (phase * 4.0f);
+            else
+                sample = -4.0f + (phase * 4.0f);
+            break;
+
+        case 4: // NOISE_LONG
+        case 5: // NOISE_SHORT
+        {
+            // シフトレジスタによるノイズ生成
+            bool bit = (noiseRegister & 1) ^ ((waveType == 4) ? ((noiseRegister >> 1) & 1) : ((noiseRegister >> 6) & 1));
+            noiseRegister = (noiseRegister >> 1) | (bit << 14);
+            sample = (noiseRegister & 1) ? 1.0f : -1.0f;
+            break;
+        }
+        }
+
+        phase += frequency / static_cast<float>(SAMPLE_RATE);
+        while (phase >= 1.0f)
+            phase -= 1.0f;
+
+        return sample * envLevel * volume * expression * (velocity / 127.0f);
+    }
+};
+
+// シンセサイザークラス
+class NesSynth
+{
+private:
+    Voice voices[MAX_VOICES];
+    float masterVolume = 1.0f;
+    float channelVolume[MAX_CHANNELS] = {1.0f};
+    float channelExpression[MAX_CHANNELS] = {1.0f};
+    int channelWaveType[MAX_CHANNELS] = {0}; // デフォルトはSQUARE
+    int pitchBendRange = 2;                  // デフォルトは2半音
+    int16_t pitchBend[MAX_CHANNELS] = {0};
+
+public:
+    void noteOn(uint8_t channel, uint8_t note, uint8_t velocity)
+    {
+        // 未使用のボイスを探す
+        Voice *targetVoice = nullptr;
+        for (auto &voice : voices)
+        {
+            if (!voice.isActive())
+            {
+                targetVoice = &voice;
+                break;
+            }
+        }
+
+        // 未使用のボイスがない場合、最も古いノートを上書き
+        if (!targetVoice)
+        {
+            targetVoice = &voices[0];
+        }
+
+        targetVoice->setWaveType(channelWaveType[channel]);
+        targetVoice->setVolume(channelVolume[channel]);
+        targetVoice->setExpression(channelExpression[channel]);
+        targetVoice->noteOn(channel, note, velocity);
+    }
+
+    void noteOff(uint8_t channel, uint8_t note)
+    {
+        for (auto &voice : voices)
+        {
+            if (voice.isActive() && voice.getNote() == note && voice.getChannel() == channel)
+            {
+                voice.noteOff();
+            }
+        }
+    }
+
+    void setProgramChange(uint8_t channel, uint8_t program)
+    {
+        switch (program)
+        {
+        case 1:
+            channelWaveType[channel] = 0; // SQUARE
+            break;
+        case 2:
+            channelWaveType[channel] = 1; // PULSE_25
+            break;
+        case 3:
+            channelWaveType[channel] = 2; // PULSE_12_5
+            break;
+        case 4:
+            channelWaveType[channel] = 3; // PSEUDO_TRI
+            break;
+        case 5:
+            channelWaveType[channel] = 4; // NOISE_LONG
+            break;
+        case 6:
+            channelWaveType[channel] = 5; // NOISE_SHORT
+            break;
+        }
+    }
+
+    void setControlChange(uint8_t channel, uint8_t number, uint8_t value)
+    {
+        switch (number)
+        {
+        case 7: // ボリューム
+            channelVolume[channel] = value / 127.0f;
+            break;
+        case 11: // エクスプレッション
+            channelExpression[channel] = value / 127.0f;
+            break;
+        case 72: // リリースタイム
+            for (auto &voice : voices)
+            {
+                if (voice.getChannel() == channel)
+                {
+                    voice.setReleaseTime(value / 127.0f * 2.0f); // 最大2秒
+                }
+            }
+            break;
+        case 73: // アタックタイム
+            for (auto &voice : voices)
+            {
+                if (voice.getChannel() == channel)
+                {
+                    voice.setAttackTime(value / 127.0f * 2.0f); // 最大2秒
+                }
+            }
+            break;
+        case 75: // ディケイタイム
+            for (auto &voice : voices)
+            {
+                if (voice.getChannel() == channel)
+                {
+                    voice.setDecayTime(value / 127.0f * 2.0f); // 最大2秒
+                }
+            }
+            break;
+        }
+    }
+
+    void setPitchBend(uint8_t channel, int16_t value)
+    {
+        pitchBend[channel] = value;
+    }
+
+    void setPitchBendRange(int range)
+    {
+        pitchBendRange = constrain(range, 2, 24);
+    }
+
+    void setMasterVolume(float volume)
+    {
+        masterVolume = constrain(volume, 0.0f, 1.0f);
+    }
+
+    float process()
+    {
+        float output = 0.0f;
+        int activeVoices = 0;
+
+        for (auto &voice : voices)
+        {
+            if (voice.isActive())
+            {
+                output += voice.process();
+                activeVoices++;
+            }
+        }
+
+        // アクティブな音声がある場合、平均を取る
+        if (activeVoices > 0)
+        {
+            output /= activeVoices;
+        }
+
+        return output * masterVolume;
+    }
+};
+
+NesSynth synth;
+
+// オーディオタスク
+void audioTask(void *arg)
+{
+    constexpr size_t BUFFER_SIZE = 128;
+    int16_t buffer[BUFFER_SIZE];
+
+    while (true)
+    {
+        for (int i = 0; i < BUFFER_SIZE; ++i)
+        {
+            float sample = synth.process();
+            // float to int16_t変換(クリッピング付き)
+            buffer[i] = static_cast<int16_t>(constrain(sample * 32767.0f, -32767.0f, 32767.0f));
+        }
+
+        M5Cardputer.Speaker.playRaw((const int16_t *)buffer, BUFFER_SIZE, SAMPLE_RATE, false, 1, 0);
+        vTaskDelay(1); // タスクの実行を一時的に中断して他のタスクに実行を譲る
+    }
+}
+
+void handleNoteOn(byte channel, byte note, byte velocity)
+{
+    synth.noteOn(channel - 1, note, velocity);
+}
+
+void handleNoteOff(byte channel, byte note, byte velocity)
+{
+    synth.noteOff(channel - 1, note);
+}
+
+void handleProgramChange(byte channel, byte number)
+{
+    synth.setProgramChange(channel - 1, number);
+}
+
+void handleControlChange(byte channel, byte number, byte value)
+{
+    synth.setControlChange(channel - 1, number, value);
+}
+
+void handlePitchBend(byte channel, int bend)
+{
+    synth.setPitchBend(channel - 1, bend);
+}
+
+void setup()
+{
+    auto cfg = M5.config();
+    M5Cardputer.begin(cfg);
+    M5Cardputer.Display.setRotation(1);
+    M5Cardputer.Speaker.begin();
+    M5Cardputer.Speaker.setVolume(128);
+
+    // MIDI設定(RX:1, TX:2)
+    Serial2.begin(31250, SERIAL_8N1, 1, 2);
+    Serial.begin(115200);
+    MIDI.setHandleNoteOn(handleNoteOn);
+    MIDI.setHandleNoteOff(handleNoteOff);
+    MIDI.setHandleProgramChange(handleProgramChange);
+    MIDI.setHandleControlChange(handleControlChange);
+    MIDI.setHandlePitchBend(handlePitchBend);
+    MIDI.begin(MIDI_CHANNEL_OMNI);
+
+    Serial.println("MIDI Ready!");
+
+    // オーディオタスクの開始
+    xTaskCreatePinnedToCore(audioTask, "audioTask", 4096, NULL, 5, NULL, 1);
+    delay(100); // タスクの起動を待つ
+
+    // テスト音の再生(起動時に0.5秒)
+    // M5Cardputer.Speaker.tone(440, 500);
+
+    synth.noteOn(0, 69, 127); // 中央のド(MIDI note 60)を最大音量で再生
+    delay(500);
+    synth.noteOff(0, 69);
+
+    M5Cardputer.Display.fillRect(0, M5Cardputer.Display.height() - 4,
+                                 M5Cardputer.Display.width(), 4, YELLOW);
+    M5Cardputer.Display.setTextSize(2);
+    M5Cardputer.Display.println("NES Synth Ready!");
+    Serial.println("NES Synth Ready!");
+}
+
+void loop()
+{
+    M5Cardputer.update();
+    MIDI.read();
+}
