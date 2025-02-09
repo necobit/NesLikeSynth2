@@ -6,8 +6,8 @@
 
 // サンプリング周波数
 const int SAMPLE_RATE = 44100;
-// バッファサイズ(4秒分)
-const int BUFFER_SIZE = SAMPLE_RATE * 4;
+// 最大バッファサイズ(ノイズ用)
+const int MAX_BUFFER_SIZE = SAMPLE_RATE / 4; // 0.25秒分
 // MIDIチャンネル
 const int MIDI_CHANNEL = 1;
 // MIDIシリアルピン
@@ -42,6 +42,7 @@ struct AudioBuffer
     float volume;
     float frequency;
     uint8_t note;
+    float currentPhase; // 波形の現在の位相を追跡
 };
 
 // 現在のバッファ
@@ -56,12 +57,13 @@ float noteToFreq(uint8_t note)
 // バッファの初期化
 void initBuffer(AudioBuffer &buffer)
 {
-    buffer.data = (int16_t *)malloc(BUFFER_SIZE * sizeof(int16_t));
-    buffer.size = BUFFER_SIZE;
+    buffer.data = (int16_t *)malloc(MAX_BUFFER_SIZE * sizeof(int16_t));
+    buffer.size = MAX_BUFFER_SIZE;
     buffer.isPlaying = false;
     buffer.volume = 0.0f;
     buffer.frequency = 440.0f;
     buffer.note = 69;
+    buffer.currentPhase = 0.0f;
 }
 
 // バッファのクリーンアップ
@@ -74,25 +76,6 @@ void cleanupBuffer(AudioBuffer &buffer)
     }
 }
 
-// 波形を生成
-void generateWaveform(AudioBuffer &buffer, float frequency, float volume)
-{
-    if (buffer.data == nullptr)
-        return;
-
-    // 波形データを生成
-    NesWaveform::generateWaveform(buffer.data, buffer.size, frequency, SAMPLE_RATE, currentWaveform);
-
-    // 音量を適用
-    for (size_t i = 0; i < buffer.size; i++)
-    {
-        buffer.data[i] = buffer.data[i] * volume;
-    }
-
-    buffer.frequency = frequency;
-    buffer.volume = volume;
-}
-
 // 波形を生成して再生
 void playNote(uint8_t note, uint8_t velocity)
 {
@@ -100,16 +83,20 @@ void playNote(uint8_t note, uint8_t velocity)
     float volume = velocity / 127.0f;
 
     // 波形データを生成
-    generateWaveform(currentBuffer, frequency, volume);
+    NesWaveform::generateWaveform(currentBuffer.data, currentBuffer.size, frequency, SAMPLE_RATE, currentWaveform);
     currentBuffer.note = note;
+    currentBuffer.volume = volume;     // volumeを保存
+    currentBuffer.currentPhase = 0.0f; // 位相をリセット
 
     // 波形名を表示
-    M5.Display.clear();
+    M5.Display.fillScreen(BLACK);
     M5.Display.setCursor(0, 0);
     M5.Display.printf("%s\n%3.1fHz", WAVEFORMS[currentWaveform].name, frequency);
 
     // 生成したデータをループ再生
-    M5.Speaker.playRaw(currentBuffer.data, currentBuffer.size, SAMPLE_RATE, true, 1.0f);
+    M5.Speaker.setVolume(128);
+    // チャンネル0を使用、ループ再生、音量1.0、バッファ数8
+    M5.Speaker.playRaw(currentBuffer.data, currentBuffer.size, SAMPLE_RATE, true, 1.0f, 0, 8);
     currentBuffer.isPlaying = true;
 }
 
@@ -127,6 +114,7 @@ void handleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity)
 {
     if (velocity > 0)
     {
+
         playNote(note, velocity);
     }
     else
@@ -145,19 +133,20 @@ void handleNoteOff(uint8_t channel, uint8_t note, uint8_t velocity)
 
 void handleProgramChange(uint8_t channel, uint8_t program)
 {
-    // プログラム番号は1-6を使用
-    if (program >= 1 && program <= 6)
+    // プログラム番号は0-5を使用
+    if (program >= 0 && program <= 5)
     {
-        currentWaveform = static_cast<NesWaveform::WaveformType>(program - 1);
+        currentWaveform = static_cast<NesWaveform::WaveformType>(program);
 
         // 波形名を表示
-        M5.Display.clear();
+        M5.Display.fillScreen(BLACK);
         M5.Display.setCursor(0, 0);
         M5.Display.printf("波形変更:\n%s", WAVEFORMS[currentWaveform].name);
 
         // 現在音が鳴っている場合は、新しい波形で再生し直す
         if (currentBuffer.isPlaying)
         {
+            stopNote();
             playNote(currentBuffer.note, currentBuffer.volume * 127);
         }
     }
@@ -183,17 +172,8 @@ void setup()
     MIDI.setHandleNoteOff(handleNoteOff);
     MIDI.setHandleProgramChange(handleProgramChange);
 
-    M5.Display.setTextSize(2);
-
     // バッファの初期化
     initBuffer(currentBuffer);
-
-    // Serial2のピン設定とMIDIの初期化
-    Serial2.begin(31250, SERIAL_8N1, MIDI_RX_PIN, MIDI_TX_PIN);
-    MIDI.begin(MIDI_CHANNEL);
-    MIDI.setHandleNoteOn(handleNoteOn);
-    MIDI.setHandleNoteOff(handleNoteOff);
-    MIDI.setHandleProgramChange(handleProgramChange);
 
     // 初期画面表示
     M5.Display.fillScreen(BLACK);
