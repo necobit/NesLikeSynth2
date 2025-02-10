@@ -20,7 +20,7 @@ public:
     // 波形データを生成
     static void generateWaveform(int16_t *buffer, size_t length, float frequency, float sampleRate, WaveformType type)
     {
-        const float amplitude = 32767.0f;
+        const float amplitude = 16384.0f; // 最大振幅を半分に抑える
         const float period = sampleRate / frequency;
 
         switch (type)
@@ -50,10 +50,15 @@ private:
     // 矩形波/パルス波生成
     static void generateSquareWave(int16_t *buffer, size_t length, float period, float amplitude, float duty)
     {
+        float phase = 0.0f;
+        const float phaseIncrement = 1.0f / period;
+
         for (size_t i = 0; i < length; i++)
         {
-            float phase = fmod(i, period) / period;
             buffer[i] = (phase < duty) ? amplitude : -amplitude;
+            phase += phaseIncrement;
+            if (phase >= 1.0f)
+                phase -= 1.0f;
         }
     }
 
@@ -62,10 +67,11 @@ private:
     {
         const int STEPS = 15; // ファミコンの三角波は15段階
         const float stepHeight = amplitude / STEPS;
+        float phase = 0.0f;
+        const float phaseIncrement = 1.0f / period;
 
         for (size_t i = 0; i < length; i++)
         {
-            float phase = fmod(i, period) / period;
             if (phase < 0.5f)
             {
                 // 上昇部分
@@ -78,18 +84,23 @@ private:
                 int step = (int)((1.0f - phase) * 2 * STEPS);
                 buffer[i] = step * stepHeight;
             }
+
+            phase += phaseIncrement;
+            if (phase >= 1.0f)
+                phase -= 1.0f;
         }
     }
 
     // ノイズ生成
     static void generateNoise(int16_t *buffer, size_t length, float amplitude, bool shortPeriod)
     {
-        uint16_t lfsr = 1; // Linear Feedback Shift Register
+        uint16_t lfsr = 1;                          // Linear Feedback Shift Register
+        const int updateRate = shortPeriod ? 2 : 4; // 更新頻度を上げる
 
         for (size_t i = 0; i < length; i++)
         {
             // ノイズの周期を調整
-            if (i % (shortPeriod ? 4 : 8) == 0)
+            if (i % updateRate == 0)
             {
                 // シフトレジスタの更新
                 uint16_t bit = ((lfsr >> 0) ^ (lfsr >> (shortPeriod ? 6 : 1))) & 1;
