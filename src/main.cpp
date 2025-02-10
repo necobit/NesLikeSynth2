@@ -7,8 +7,6 @@
 
 // サンプリング周波数
 const int SAMPLE_RATE = 44100;
-// 最大バッファサイズ(ノイズ用)
-const int MAX_BUFFER_SIZE = SAMPLE_RATE; // 1秒分(最大値)
 // MIDIチャンネル
 const int MIDI_CHANNEL = MIDI_CHANNEL_OMNI;
 // MIDIシリアルピン
@@ -17,12 +15,16 @@ const int MIDI_TX_PIN = 2;
 
 // I2S設定
 const i2s_port_t I2S_PORT = I2S_NUM_0;
-const int I2S_BCLK = 41; // I2S BCLKピン
-const int I2S_LRCK = 43; // I2S WS(LRCK)ピン
-const int I2S_DOUT = 42; // I2S DATAピン
+const int I2S_BCLK = 41;
+const int I2S_LRCK = 43;
+const int I2S_DOUT = 42;
 
 // 現在の波形タイプ
 NesWaveform::WaveformType currentWaveform = NesWaveform::SQUARE;
+
+void handleNoteOff(uint8_t channel, uint8_t note, uint8_t velocity); // プロトタイプ宣言
+
+void handleNoteOff(uint8_t channel, uint8_t note, uint8_t velocity); // プロトタイプ宣言
 
 // 波形の種類と名前の配列
 const struct
@@ -40,48 +42,18 @@ const struct
 // MIDIインターフェースの設定
 MIDI_CREATE_INSTANCE(HardwareSerial, Serial2, MIDI);
 
-// オーディオバッファ
-struct AudioBuffer
+// 音声パラメータ構造体
+struct VoiceParams
 {
-    int16_t *data;
-    size_t size;
-    bool isPlaying;
-    float volume;
-    float frequency;
-    uint8_t note;
-    float currentPhase;        // 波形の現在の位相を追跡
-    TaskHandle_t playbackTask; // 再生用タスクハンドル
+    bool isActive;   // 発音中かどうか
+    float volume;    // 音量
+    float frequency; // 周波数
+    float phase;     // 現在の位相
+    uint8_t note;    // MIDIノート番号
 };
 
-// 現在のバッファ
-AudioBuffer currentBuffer;
-
-// 再生用タスク
-void playbackTask(void *parameter)
-{
-    AudioBuffer *buffer = (AudioBuffer *)parameter;
-    size_t bytesWritten = 0;
-
-    while (buffer->isPlaying)
-    {
-        // ステレオデータを作成(左右同じデータ)
-        int16_t stereoData[2];
-        static size_t currentIndex = 0;
-
-        // 音量を適用
-        stereoData[0] = stereoData[1] = buffer->data[currentIndex] * buffer->volume;
-
-        // I2Sにデータを書き込み
-        i2s_write(I2S_PORT, stereoData, sizeof(stereoData), &bytesWritten, portMAX_DELAY);
-
-        // インデックスを更新(ループ再生)
-        currentIndex = (currentIndex + 1) % buffer->size;
-    }
-
-    // タスクを削除
-    buffer->playbackTask = nullptr;
-    vTaskDelete(NULL);
-}
+// 音声パラメータ
+VoiceParams voice;
 
 // MIDIノート番号から周波数を計算
 float noteToFreq(uint8_t note)
@@ -89,105 +61,111 @@ float noteToFreq(uint8_t note)
     return 440.0f * pow(2.0f, (note - 69) / 12.0f);
 }
 
-// バッファの初期化
-void initBuffer(AudioBuffer &buffer)
+// 波形生成関数
+int16_t generateSample()
 {
-    buffer.data = (int16_t *)malloc(MAX_BUFFER_SIZE * sizeof(int16_t));
-    buffer.size = MAX_BUFFER_SIZE;
-    buffer.isPlaying = false;
-    buffer.volume = 0.0f;
-    buffer.frequency = 440.0f;
-    buffer.note = 69;
-    buffer.currentPhase = 0.0f;
-    buffer.playbackTask = nullptr;
+    if (!voice.isActive)
+        return 0;
+
+    // 位相から波形値を計算
+    int16_t sample = 0;
+    float phaseIncrement = voice.frequency / SAMPLE_RATE;
+
+    switch (currentWaveform)
+    {
+    case NesWaveform::SQUARE:
+        sample = (voice.phase < 0.5f) ? 32767 : -32767;
+        break;
+    case NesWaveform::PULSE_25:
+        sample = (voice.phase < 0.25f) ? 32767 : -32767;
+        break;
+    case NesWaveform::PULSE_12_5:
+        sample = (voice.phase < 0.125f) ? 32767 : -32767;
+        break;
+    case NesWaveform::TRIANGLE:
+        if (voice.phase < 0.25f)
+            sample = voice.phase * 4 * 32767;
+        else if (voice.phase < 0.75f)
+            sample = (0.5f - voice.phase) * 4 * 32767;
+        else
+            sample = (voice.phase - 1.0f) * 4 * 32767;
+        break;
+    case NesWaveform::NOISE_LONG:
+    case NesWaveform::NOISE_SHORT:
+    {
+        static uint16_t lfsr = 1;
+        bool bit;
+        if (currentWaveform == NesWaveform::NOISE_LONG)
+            bit = ((lfsr >> 0) ^ (lfsr >> 1)) & 1;
+        else
+            bit = ((lfsr >> 0) ^ (lfsr >> 6)) & 1;
+        lfsr = (lfsr >> 1) | (bit << 14);
+        sample = bit ? 32767 : -32767;
+        break;
+    }
+    }
+
+    // 位相を更新
+    voice.phase += phaseIncrement;
+    if (voice.phase >= 1.0f)
+        voice.phase -= 1.0f;
+
+    // 音量を適用
+    return sample * voice.volume;
 }
 
-// バッファのクリーンアップ
-void cleanupBuffer(AudioBuffer &buffer)
+// 音声出力タスク
+void audioOutputTask(void *parameter)
 {
-    if (buffer.data != nullptr)
+    while (true)
     {
-        free(buffer.data);
-        buffer.data = nullptr;
+        int16_t stereoSample[2];
+        size_t bytesWritten;
+
+        // ステレオサンプルを生成
+        int16_t sample = generateSample();
+        stereoSample[0] = stereoSample[1] = sample;
+
+        // I2Sに出力
+        i2s_write(I2S_PORT, stereoSample, sizeof(stereoSample), &bytesWritten, portMAX_DELAY);
     }
 }
 
-// 波形を生成して再生
-void playNote(uint8_t note, uint8_t velocity)
-{
-    float frequency = noteToFreq(note);
-    float volume = velocity / 127.0f;
-
-    // バッファサイズを周波数に応じて1周期分に設定
-    currentBuffer.size = static_cast<size_t>(SAMPLE_RATE / frequency);
-
-    // 波形データを生成
-    NesWaveform::generateWaveform(currentBuffer.data, currentBuffer.size, frequency, SAMPLE_RATE, currentWaveform);
-    currentBuffer.note = note;
-    currentBuffer.volume = volume;
-    currentBuffer.currentPhase = 0.0f;
-
-    // 波形名を表示
-    M5.Display.fillScreen(BLACK);
-    M5.Display.setCursor(0, 0);
-    M5.Display.printf("%s\n%3.1fHz", WAVEFORMS[currentWaveform].name, frequency);
-
-    // 再生タスクを開始
-    currentBuffer.isPlaying = true;
-    xTaskCreate(
-        playbackTask,
-        "PlaybackTask",
-        4096,
-        &currentBuffer,
-        1,
-        &currentBuffer.playbackTask);
-
-    M5.Display.setCursor(0, 70);
-    M5.Display.printf("音再生");
-}
-
-// 音を停止
-void stopNote()
-{
-    if (currentBuffer.isPlaying)
-    {
-        M5.Display.setCursor(0, 70);
-        M5.Display.printf("音停止");
-
-        // 再生フラグをオフにしてタスクを終了させる
-        currentBuffer.isPlaying = false;
-
-        // タスクが完全に終了するまで待機
-        while (currentBuffer.playbackTask != nullptr)
-        {
-            delay(1);
-        }
-    }
-}
-
+// ノートオン処理
 void handleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity)
 {
     if (velocity > 0)
     {
-        playNote(note, velocity);
+        voice.isActive = true;
+        voice.frequency = noteToFreq(note);
+        voice.volume = velocity / 127.0f;
+        voice.note = note;
+
+        // 波形名と周波数を表示
+        M5.Display.fillScreen(BLACK);
+        M5.Display.setCursor(0, 0);
+        M5.Display.printf("%s\n%3.1fHz", WAVEFORMS[currentWaveform].name, voice.frequency);
     }
     else
     {
-        stopNote();
+        handleNoteOff(channel, note, velocity);
     }
 }
 
+// ノートオフ処理
 void handleNoteOff(uint8_t channel, uint8_t note, uint8_t velocity)
 {
-    if (currentBuffer.note == note)
+    if (voice.note == note)
     {
-        stopNote();
+        voice.isActive = false;
+        M5.Display.setCursor(0, 70);
+        M5.Display.printf("音停止");
     }
 }
 
+// プログラムチェンジ処理
 void handleProgramChange(uint8_t channel, uint8_t program)
 {
-    // プログラム番号は0-5を使用
     if (program >= 0 && program <= 5)
     {
         currentWaveform = static_cast<NesWaveform::WaveformType>(program);
@@ -196,13 +174,6 @@ void handleProgramChange(uint8_t channel, uint8_t program)
         M5.Display.fillScreen(BLACK);
         M5.Display.setCursor(0, 0);
         M5.Display.printf("波形変更:\n%s", WAVEFORMS[currentWaveform].name);
-
-        // 現在音が鳴っている場合は、新しい波形で再生し直す
-        if (currentBuffer.isPlaying)
-        {
-            stopNote();
-            playNote(currentBuffer.note, currentBuffer.volume * 127);
-        }
     }
 }
 
@@ -213,10 +184,9 @@ void setup()
     M5.begin(cfg);
 
     delay(2000);
-    M5.Display.setTextSize(2);
+    M5.Display.setTextSize(1);
     M5.Display.setFont(&fonts::efontJA_16);
     M5.Display.setCursor(0, 0);
-
     M5.Display.printf("Initializing...\n");
 
     // I2S設定
@@ -233,7 +203,6 @@ void setup()
         .tx_desc_auto_clear = true,
         .fixed_mclk = 0};
 
-    // I2Sピン設定
     i2s_pin_config_t pin_config = {
         .bck_io_num = I2S_BCLK,
         .ws_io_num = I2S_LRCK,
@@ -246,8 +215,12 @@ void setup()
 
     M5.Display.printf("I2S Initialized\n");
 
-    // バッファの初期化
-    initBuffer(currentBuffer);
+    // 音声パラメータの初期化
+    voice.isActive = false;
+    voice.volume = 0.0f;
+    voice.frequency = 440.0f;
+    voice.phase = 0.0f;
+    voice.note = 69;
 
     // Serial2のピン設定とMIDIの初期化
     Serial2.begin(31250, SERIAL_8N1, MIDI_RX_PIN, MIDI_TX_PIN);
@@ -256,12 +229,19 @@ void setup()
     MIDI.setHandleNoteOff(handleNoteOff);
     MIDI.setHandleProgramChange(handleProgramChange);
 
+    // 音声出力タスクの開始
+    xTaskCreate(
+        audioOutputTask,
+        "AudioOutput",
+        4096,
+        NULL,
+        1,
+        NULL);
+
     // 初期画面表示
     M5.Display.fillScreen(BLACK);
     M5.Display.setCursor(0, 0);
     M5.Display.printf("NES Synth\n%s", WAVEFORMS[currentWaveform].name);
-
-    // 初期音テスト
 }
 
 void loop()
