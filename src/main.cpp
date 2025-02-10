@@ -45,15 +45,17 @@ MIDI_CREATE_INSTANCE(HardwareSerial, Serial2, MIDI);
 // 音声パラメータ構造体
 struct VoiceParams
 {
-    bool isActive;   // 発音中かどうか
-    float volume;    // 音量
-    float frequency; // 周波数
-    float phase;     // 現在の位相
-    uint8_t note;    // MIDIノート番号
+    bool isActive;                      // 発音中かどうか
+    float volume;                       // 音量
+    float frequency;                    // 周波数
+    float phase;                        // 現在の位相
+    uint8_t note;                       // MIDIノート番号
+    NesWaveform::WaveformType waveform; // 波形タイプ
 };
 
-// 音声パラメータ
-VoiceParams voice;
+// 音声パラメータ(16チャンネル)
+const int MAX_VOICES = 16;
+VoiceParams voices[MAX_VOICES];
 
 // MIDIノート番号から周波数を計算
 float noteToFreq(uint8_t note)
@@ -64,54 +66,69 @@ float noteToFreq(uint8_t note)
 // 波形生成関数
 int16_t generateSample()
 {
-    if (!voice.isActive)
-        return 0;
+    int32_t mixedSample = 0;
+    int activeVoices = 0;
 
-    // 位相から波形値を計算
-    int16_t sample = 0;
-    float phaseIncrement = voice.frequency / SAMPLE_RATE;
-
-    switch (currentWaveform)
+    // 全てのアクティブな音声を合成
+    for (int i = 0; i < MAX_VOICES; i++)
     {
-    case NesWaveform::SQUARE:
-        sample = (voice.phase < 0.5f) ? 32767 : -32767;
-        break;
-    case NesWaveform::PULSE_25:
-        sample = (voice.phase < 0.25f) ? 32767 : -32767;
-        break;
-    case NesWaveform::PULSE_12_5:
-        sample = (voice.phase < 0.125f) ? 32767 : -32767;
-        break;
-    case NesWaveform::TRIANGLE:
-        if (voice.phase < 0.25f)
-            sample = voice.phase * 4 * 32767;
-        else if (voice.phase < 0.75f)
-            sample = (0.5f - voice.phase) * 4 * 32767;
-        else
-            sample = (voice.phase - 1.0f) * 4 * 32767;
-        break;
-    case NesWaveform::NOISE_LONG:
-    case NesWaveform::NOISE_SHORT:
+        if (!voices[i].isActive)
+            continue;
+
+        activeVoices++;
+        float phaseIncrement = voices[i].frequency / SAMPLE_RATE;
+        int16_t sample = 0;
+
+        switch (voices[i].waveform)
+        {
+        case NesWaveform::SQUARE:
+            sample = (voices[i].phase < 0.5f) ? 32767 : -32767;
+            break;
+        case NesWaveform::PULSE_25:
+            sample = (voices[i].phase < 0.25f) ? 32767 : -32767;
+            break;
+        case NesWaveform::PULSE_12_5:
+            sample = (voices[i].phase < 0.125f) ? 32767 : -32767;
+            break;
+        case NesWaveform::TRIANGLE:
+            if (voices[i].phase < 0.25f)
+                sample = voices[i].phase * 4 * 32767;
+            else if (voices[i].phase < 0.75f)
+                sample = (0.5f - voices[i].phase) * 4 * 32767;
+            else
+                sample = (voices[i].phase - 1.0f) * 4 * 32767;
+            break;
+        case NesWaveform::NOISE_LONG:
+        case NesWaveform::NOISE_SHORT:
+        {
+            static uint16_t lfsr = 1;
+            bool bit;
+            if (voices[i].waveform == NesWaveform::NOISE_LONG)
+                bit = ((lfsr >> 0) ^ (lfsr >> 1)) & 1;
+            else
+                bit = ((lfsr >> 0) ^ (lfsr >> 6)) & 1;
+            lfsr = (lfsr >> 1) | (bit << 14);
+            sample = bit ? 32767 : -32767;
+            break;
+        }
+        }
+
+        // 位相を更新
+        voices[i].phase += phaseIncrement;
+        if (voices[i].phase >= 1.0f)
+            voices[i].phase -= 1.0f;
+
+        // 音量を適用
+        mixedSample += sample * voices[i].volume;
+    }
+
+    // アクティブな音声がある場合は平均化
+    if (activeVoices > 0)
     {
-        static uint16_t lfsr = 1;
-        bool bit;
-        if (currentWaveform == NesWaveform::NOISE_LONG)
-            bit = ((lfsr >> 0) ^ (lfsr >> 1)) & 1;
-        else
-            bit = ((lfsr >> 0) ^ (lfsr >> 6)) & 1;
-        lfsr = (lfsr >> 1) | (bit << 14);
-        sample = bit ? 32767 : -32767;
-        break;
-    }
+        mixedSample /= activeVoices;
     }
 
-    // 位相を更新
-    voice.phase += phaseIncrement;
-    if (voice.phase >= 1.0f)
-        voice.phase -= 1.0f;
-
-    // 音量を適用
-    return sample * voice.volume;
+    return mixedSample;
 }
 
 // 音声出力タスク
@@ -131,20 +148,35 @@ void audioOutputTask(void *parameter)
     }
 }
 
+// 空いているボイスを探す
+int findFreeVoice()
+{
+    // まず非アクティブなボイスを探す
+    for (int i = 0; i < MAX_VOICES; i++)
+    {
+        if (!voices[i].isActive)
+            return i;
+    }
+    // 空きがない場合は最も古いボイスを再利用
+    return 0;
+}
+
 // ノートオン処理
 void handleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity)
 {
     if (velocity > 0)
     {
-        voice.isActive = true;
-        voice.frequency = noteToFreq(note);
-        voice.volume = velocity / 127.0f;
-        voice.note = note;
+        int voiceIndex = findFreeVoice();
+        voices[voiceIndex].isActive = true;
+        voices[voiceIndex].frequency = noteToFreq(note);
+        voices[voiceIndex].volume = velocity / 127.0f;
+        voices[voiceIndex].note = note;
+        voices[voiceIndex].waveform = currentWaveform;
 
         // 波形名と周波数を表示
         M5.Display.fillScreen(BLACK);
         M5.Display.setCursor(0, 0);
-        M5.Display.printf("%s\n%3.1fHz", WAVEFORMS[currentWaveform].name, voice.frequency);
+        M5.Display.printf("CH%d: %s\n%3.1fHz", voiceIndex + 1, WAVEFORMS[currentWaveform].name, voices[voiceIndex].frequency);
     }
     else
     {
@@ -155,11 +187,15 @@ void handleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity)
 // ノートオフ処理
 void handleNoteOff(uint8_t channel, uint8_t note, uint8_t velocity)
 {
-    if (voice.note == note)
+    // 該当するノートを持つ全てのボイスを停止
+    for (int i = 0; i < MAX_VOICES; i++)
     {
-        voice.isActive = false;
-        M5.Display.setCursor(0, 70);
-        M5.Display.printf("音停止");
+        if (voices[i].isActive && voices[i].note == note)
+        {
+            voices[i].isActive = false;
+            M5.Display.setCursor(0, 70);
+            M5.Display.printf("CH%d停止", i + 1);
+        }
     }
 }
 
@@ -216,11 +252,15 @@ void setup()
     M5.Display.printf("I2S Initialized\n");
 
     // 音声パラメータの初期化
-    voice.isActive = false;
-    voice.volume = 0.0f;
-    voice.frequency = 440.0f;
-    voice.phase = 0.0f;
-    voice.note = 69;
+    for (int i = 0; i < MAX_VOICES; i++)
+    {
+        voices[i].isActive = false;
+        voices[i].volume = 0.0f;
+        voices[i].frequency = 440.0f;
+        voices[i].phase = 0.0f;
+        voices[i].note = 69;
+        voices[i].waveform = NesWaveform::SQUARE;
+    }
 
     // Serial2のピン設定とMIDIの初期化
     Serial2.begin(31250, SERIAL_8N1, MIDI_RX_PIN, MIDI_TX_PIN);
