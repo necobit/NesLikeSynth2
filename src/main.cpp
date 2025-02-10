@@ -5,8 +5,22 @@
 #include <cmath>
 #include "NesWaveform.h"
 
-// サンプリング周波数
+// 音声パラメータ構造体
+struct VoiceParams
+{
+    bool isActive;                      // 発音中かどうか
+    float volume;                       // 音量
+    float frequency;                    // 周波数
+    float phase;                        // 現在の位相
+    uint8_t note;                       // MIDIノート番号
+    NesWaveform::WaveformType waveform; // 波形タイプ
+};
+
+// 音声パラメータ設定
 const int SAMPLE_RATE = 44100;
+const int MIDI_CHANNELS = 16;
+const int VOICES_PER_CHANNEL = 6;
+
 // MIDIチャンネル
 const int MIDI_CHANNEL = MIDI_CHANNEL_OMNI;
 // MIDIシリアルピン
@@ -19,43 +33,44 @@ const int I2S_BCLK = 41;
 const int I2S_LRCK = 43;
 const int I2S_DOUT = 42;
 
-// 現在の波形タイプ
-NesWaveform::WaveformType currentWaveform = NesWaveform::SQUARE;
-
-void handleNoteOff(uint8_t channel, uint8_t note, uint8_t velocity); // プロトタイプ宣言
-
-void handleNoteOff(uint8_t channel, uint8_t note, uint8_t velocity); // プロトタイプ宣言
-
 // 波形の種類と名前の配列
-const struct
-{
-    NesWaveform::WaveformType type;
-    const char *name;
-} WAVEFORMS[] = {
-    {NesWaveform::SQUARE, "Square"},
-    {NesWaveform::PULSE_25, "25%Pulse"},
-    {NesWaveform::PULSE_12_5, "12.5%Pulse"},
-    {NesWaveform::TRIANGLE, "Triangle"},
-    {NesWaveform::NOISE_LONG, "Long Noise"},
-    {NesWaveform::NOISE_SHORT, "Short Noise"}};
+const char *WAVEFORM_NAMES[] = {
+    "Square",     // 0
+    "25%Pulse",   // 1
+    "12.5%Pulse", // 2
+    "Triangle",   // 3
+    "Long Noise", // 4
+    "Short Noise" // 5
+};
+
+// チャンネルごとの波形タイプ
+NesWaveform::WaveformType channelWaveforms[] = {
+    NesWaveform::SQUARE,     // CH1: 矩形波
+    NesWaveform::SQUARE,     // CH2: 矩形波
+    NesWaveform::PULSE_25,   // CH3: パルス波25%
+    NesWaveform::PULSE_12_5, // CH4: パルス波12.5%
+    NesWaveform::TRIANGLE,   // CH5: 三角波
+    NesWaveform::SQUARE,     // CH6
+    NesWaveform::SQUARE,     // CH7
+    NesWaveform::SQUARE,     // CH8
+    NesWaveform::SQUARE,     // CH9
+    NesWaveform::NOISE_LONG, // CH10: 短周期ノイズ
+    NesWaveform::NOISE_LONG, // CH11: 短周期ノイズ
+    NesWaveform::SQUARE,     // CH12
+    NesWaveform::SQUARE,     // CH13
+    NesWaveform::SQUARE,     // CH14
+    NesWaveform::SQUARE,     // CH15
+    NesWaveform::SQUARE      // CH16
+};
+
+void handleNoteOff(uint8_t channel, uint8_t note, uint8_t velocity); // プロトタイプ宣言
+
+void handleNoteOff(uint8_t channel, uint8_t note, uint8_t velocity); // プロトタイプ宣言
 
 // MIDIインターフェースの設定
 MIDI_CREATE_INSTANCE(HardwareSerial, Serial2, MIDI);
 
-// 音声パラメータ構造体
-struct VoiceParams
-{
-    bool isActive;                      // 発音中かどうか
-    float volume;                       // 音量
-    float frequency;                    // 周波数
-    float phase;                        // 現在の位相
-    uint8_t note;                       // MIDIノート番号
-    NesWaveform::WaveformType waveform; // 波形タイプ
-};
-
-// 音声パラメータ(16MIDIチャンネル x 6和音)
-const int MIDI_CHANNELS = 16;
-const int VOICES_PER_CHANNEL = 6;
+// 音声パラメータ配列
 VoiceParams voices[MIDI_CHANNELS][VOICES_PER_CHANNEL];
 
 // MIDIノート番号から周波数を計算
@@ -187,14 +202,14 @@ void handleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity)
         voices[channel][voiceIndex].frequency = noteToFreq(note);
         voices[channel][voiceIndex].volume = velocity / 127.0f;
         voices[channel][voiceIndex].note = note;
-        voices[channel][voiceIndex].waveform = currentWaveform;
+        voices[channel][voiceIndex].waveform = channelWaveforms[channel];
 
         // 波形名と周波数を表示
         M5.Display.fillScreen(BLACK);
         M5.Display.setCursor(0, 0);
         M5.Display.printf("MIDI CH%d V%d: %s\n%3.1fHz",
                           channel + 1, voiceIndex + 1,
-                          WAVEFORMS[currentWaveform].name,
+                          WAVEFORM_NAMES[channelWaveforms[channel]],
                           voices[channel][voiceIndex].frequency);
     }
     else
@@ -223,12 +238,12 @@ void handleProgramChange(uint8_t channel, uint8_t program)
 {
     if (program >= 0 && program <= 5)
     {
-        currentWaveform = static_cast<NesWaveform::WaveformType>(program);
+        channelWaveforms[channel] = static_cast<NesWaveform::WaveformType>(program);
 
         // 波形名を表示
         M5.Display.fillScreen(BLACK);
         M5.Display.setCursor(0, 0);
-        M5.Display.printf("波形変更:\n%s", WAVEFORMS[currentWaveform].name);
+        M5.Display.printf("CH%d波形変更:\n%s", channel + 1, WAVEFORM_NAMES[channelWaveforms[channel]]);
     }
 }
 
@@ -303,7 +318,7 @@ void setup()
     // 初期画面表示
     M5.Display.fillScreen(BLACK);
     M5.Display.setCursor(0, 0);
-    M5.Display.printf("NES Synth\n%s", WAVEFORMS[currentWaveform].name);
+    M5.Display.printf("NES Synth\nMulti Channel");
 }
 
 void loop()
