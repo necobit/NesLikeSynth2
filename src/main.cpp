@@ -45,22 +45,22 @@ const char *WAVEFORM_NAMES[] = {
 
 // チャンネルごとの波形タイプ
 NesWaveform::WaveformType channelWaveforms[] = {
-    NesWaveform::SQUARE,     // CH1: 矩形波
-    NesWaveform::SQUARE,     // CH2: 矩形波
-    NesWaveform::PULSE_25,   // CH3: パルス波25%
-    NesWaveform::PULSE_12_5, // CH4: パルス波12.5%
-    NesWaveform::TRIANGLE,   // CH5: 三角波
-    NesWaveform::SQUARE,     // CH6
-    NesWaveform::SQUARE,     // CH7
-    NesWaveform::SQUARE,     // CH8
-    NesWaveform::SQUARE,     // CH9
-    NesWaveform::NOISE_LONG, // CH10: 短周期ノイズ
-    NesWaveform::NOISE_LONG, // CH11: 短周期ノイズ
-    NesWaveform::SQUARE,     // CH12
-    NesWaveform::SQUARE,     // CH13
-    NesWaveform::SQUARE,     // CH14
-    NesWaveform::SQUARE,     // CH15
-    NesWaveform::SQUARE      // CH16
+    NesWaveform::SQUARE,      // CH1: 矩形波
+    NesWaveform::PULSE_25,    // CH2: パルス波25%
+    NesWaveform::PULSE_12_5,  // CH3: パルス波12.5%
+    NesWaveform::TRIANGLE,    // CH4: 三角波
+    NesWaveform::SQUARE,      // CH5
+    NesWaveform::SQUARE,      // CH6
+    NesWaveform::SQUARE,      // CH7
+    NesWaveform::SQUARE,      // CH8
+    NesWaveform::SQUARE,      // CH9
+    NesWaveform::NOISE_LONG,  // CH10: 長周期ノイズ
+    NesWaveform::NOISE_SHORT, // CH11: 短周期ノイズ
+    NesWaveform::SQUARE,      // CH12
+    NesWaveform::SQUARE,      // CH13
+    NesWaveform::SQUARE,      // CH14
+    NesWaveform::SQUARE,      // CH15
+    NesWaveform::SQUARE       // CH16
 };
 
 void handleNoteOff(uint8_t channel, uint8_t note, uint8_t velocity); // プロトタイプ宣言
@@ -195,6 +195,7 @@ int findFreeVoice(uint8_t midiChannel)
 // ノートオン処理
 void handleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity)
 {
+    channel = channel - 1; // MIDIチャンネルは1から始まるので0からに変換
     if (velocity > 0)
     {
         int voiceIndex = findFreeVoice(channel);
@@ -221,6 +222,7 @@ void handleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity)
 // ノートオフ処理
 void handleNoteOff(uint8_t channel, uint8_t note, uint8_t velocity)
 {
+    channel = channel - 1; // MIDIチャンネルは1から始まるので0からに変換
     // 該当するMIDIチャンネル内の該当するノートを持つボイスを停止
     for (int i = 0; i < VOICES_PER_CHANNEL; i++)
     {
@@ -236,6 +238,7 @@ void handleNoteOff(uint8_t channel, uint8_t note, uint8_t velocity)
 // プログラムチェンジ処理
 void handleProgramChange(uint8_t channel, uint8_t program)
 {
+    channel = channel - 1; // MIDIチャンネルは1から始まるので0からに変換
     if (program >= 0 && program <= 5)
     {
         channelWaveforms[channel] = static_cast<NesWaveform::WaveformType>(program);
